@@ -12,18 +12,25 @@ const APIFY_KEY = process.env.APIFY_API_KEY || "";
 const PORT = parseInt(process.env.PORT || "8080");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Magnolia TX location for FB Marketplace
-const LOCATION = { city: "magnolia", state: "TX", lat: 30.2088, lng: -95.7505, radius: 30 };
+// Actor ID from Apify
+const ACTOR_ID = "memo23~facebook-marketplace-scraper-ppe";
+
+// Build FB Marketplace search URLs for Magnolia TX (Houston area, 30mi radius)
+// Format: https://www.facebook.com/marketplace/houston/search?query=TERM&maxPrice=PRICE
+function fbUrl(query, maxPrice) {
+  const params = new URLSearchParams({ query, maxPrice, minPrice: 0, daysSinceListed: 7 });
+  return `https://www.facebook.com/marketplace/houston/search/?${params.toString()}`;
+}
 
 const SEARCH_CONFIGS = [
-  { category: "🚜 Riding Mowers",  query: "riding mower",    maxPrice: 500, minPrice: 0 },
-  { category: "🔧 Power Tools",    query: "dewalt milwaukee", maxPrice: 200, minPrice: 0 },
-  { category: "🦌 Hunting Gear",   query: "deer stand",       maxPrice: 150, minPrice: 0 },
-  { category: "🏋️ Exercise Equip", query: "treadmill",        maxPrice: 100, minPrice: 0 },
-  { category: "⛳ Golf Gear",      query: "golf clubs",       maxPrice: 100, minPrice: 0 },
-  { category: "🛻 Truck Parts",    query: "tonneau cover",    maxPrice: 200, minPrice: 0 },
-  { category: "🪑 Wood Furniture", query: "wood dresser",     maxPrice: 100, minPrice: 0 },
-  { category: "🚲 Kids Gear",      query: "power wheels",     maxPrice: 50,  minPrice: 0 },
+  { category: "🚜 Riding Mowers",  query: "riding mower",    maxPrice: 500 },
+  { category: "🔧 Power Tools",    query: "dewalt milwaukee", maxPrice: 200 },
+  { category: "🦌 Hunting Gear",   query: "deer stand",       maxPrice: 150 },
+  { category: "🏋️ Exercise Equip", query: "treadmill",        maxPrice: 100 },
+  { category: "⛳ Golf Gear",      query: "golf clubs",       maxPrice: 100 },
+  { category: "🛻 Truck Parts",    query: "tonneau cover",    maxPrice: 200 },
+  { category: "🪑 Wood Furniture", query: "wood dresser",     maxPrice: 100 },
+  { category: "🚲 Kids Gear",      query: "power wheels",     maxPrice: 50  },
 ];
 
 let dealStore = [];
@@ -38,77 +45,56 @@ function addLog(msg) {
   const entry = `[${new Date().toLocaleTimeString()}] ${msg}`;
   console.log(entry);
   pollLog.unshift(entry);
-  if (pollLog.length > 50) pollLog.pop();
+  if (pollLog.length > 100) pollLog.pop();
 }
 
-// ── Apify FB Marketplace scraper ──────────────────────────────────────────────
-async function scrapeCategory(config) {
-  addLog(`Scraping FB: "${config.query}"...`);
-  try {
-    // Start Apify actor run
-    const startRes = await fetch(
-      `https://api.apify.com/v2/acts/apify~facebook-marketplace-scraper/runs?token=${APIFY_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          searchQueries: [config.query],
-          locationSearch: `${LOCATION.city}, ${LOCATION.state}`,
-          maxItems: 20,
-          minPrice: config.minPrice,
-          maxPrice: config.maxPrice,
-          condition: ["used", "new"],
-          sortBy: "creation_time_descend",
-        }),
-      }
-    );
+async function runApifyActor(urls) {
+  addLog(`Starting Apify actor with ${urls.length} URLs...`);
 
-    if (!startRes.ok) {
-      const err = await startRes.text();
-      addLog(`❌ Apify start error: ${err.slice(0, 100)}`);
-      lastError = `Apify: ${startRes.status}`;
-      return [];
+  const startRes = await fetch(
+    `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        startUrls: urls.map(url => ({ url })),
+        maxItems: 15,
+        proxy: { useApifyProxy: true },
+      }),
     }
+  );
 
-    const runData = await startRes.json();
-    const runId = runData.data?.id;
-    if (!runId) { addLog("❌ No run ID from Apify"); return []; }
-
-    addLog(`  Run started: ${runId} — waiting for results...`);
-
-    // Poll for completion (max 2 min)
-    let attempts = 0;
-    while (attempts < 24) {
-      await sleep(5000);
-      attempts++;
-      const statusRes = await fetch(
-        `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_KEY}`
-      );
-      const statusData = await statusRes.json();
-      const status = statusData.data?.status;
-
-      if (status === "SUCCEEDED") {
-        // Fetch results
-        const itemsRes = await fetch(
-          `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${APIFY_KEY}&format=json`
-        );
-        const items = await itemsRes.json();
-        addLog(`  ✅ "${config.query}": ${items.length} results`);
-        return items;
-      } else if (status === "FAILED" || status === "ABORTED") {
-        addLog(`  ❌ Run ${status} for "${config.query}"`);
-        return [];
-      }
-      addLog(`  Waiting... (${status}, attempt ${attempts}/24)`);
-    }
-
-    addLog(`  ⏱ Timeout for "${config.query}"`);
-    return [];
-  } catch (e) {
-    addLog(`❌ Error: ${e.message}`);
-    lastError = e.message;
-    return [];
+  if (!startRes.ok) {
+    const err = await startRes.text();
+    throw new Error(`Apify start failed: ${startRes.status} — ${err.slice(0, 200)}`);
   }
+
+  const runData = await startRes.json();
+  const runId = runData.data?.id;
+  if (!runId) throw new Error("No run ID returned from Apify");
+  addLog(`Run ID: ${runId} — waiting for completion...`);
+
+  // Poll until done (max 3 min)
+  for (let i = 0; i < 36; i++) {
+    await sleep(5000);
+    const statusRes = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_KEY}`);
+    const statusData = await statusRes.json();
+    const status = statusData.data?.status;
+    addLog(`  Status: ${status} (${i + 1}/36)`);
+
+    if (status === "SUCCEEDED") {
+      const itemsRes = await fetch(
+        `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${APIFY_KEY}&format=json&limit=200`
+      );
+      const items = await itemsRes.json();
+      addLog(`✅ Got ${items.length} total items from Apify`);
+      return items;
+    }
+    if (status === "FAILED" || status === "ABORTED" || status === "TIMED-OUT") {
+      throw new Error(`Apify run ${status}`);
+    }
+  }
+  throw new Error("Apify run timed out after 3 minutes");
 }
 
 async function scoreListing(listing, categoryName) {
@@ -125,7 +111,6 @@ Title: "${listing.title}"
 Price: ${listing.price === 0 ? "FREE" : "$" + listing.price}
 Condition: ${listing.condition || "unknown"}
 Location: ${listing.location || "Houston area"}
-Description: "${(listing.description || "").slice(0, 150)}"
 
 Return exactly:
 {"score":<1-10>,"verdict":"<🔥 Hot Deal|✅ Good Find|⚠️ Maybe|❌ Pass>","estimatedSellPrice":<number>,"estimatedProfit":<number>,"tip":"<one sentence>","urgency":"<Grab today|Check it out|No rush>","redFlags":"<concern or None>"}`
@@ -139,7 +124,7 @@ Return exactly:
 
 async function pollFBMarketplace() {
   if (isPolling) { addLog("Already polling, skipping"); return; }
-  if (!APIFY_KEY) { addLog("❌ No APIFY_API_KEY set"); lastError = "Missing APIFY_API_KEY"; return; }
+  if (!APIFY_KEY) { addLog("❌ No APIFY_API_KEY"); lastError = "Missing APIFY_API_KEY"; return; }
 
   isPolling = true;
   lastError = null;
@@ -147,19 +132,41 @@ async function pollFBMarketplace() {
   pollCount++;
   addLog(`\n=== Poll #${pollCount} started ===`);
 
-  const newDeals = [];
+  try {
+    // Build all search URLs
+    const urlsWithMeta = SEARCH_CONFIGS.map(c => ({
+      url: fbUrl(c.query, c.maxPrice),
+      category: c.category,
+      query: c.query,
+    }));
 
-  // Run categories sequentially to save Apify credits
-  for (const config of SEARCH_CONFIGS) {
-    const items = await scrapeCategory(config);
+    addLog(`Built ${urlsWithMeta.length} FB Marketplace search URLs`);
+    urlsWithMeta.forEach(u => addLog(`  ${u.category}: ${u.url}`));
 
-    for (const item of items) {
-      const id = item.id || item.url || item.title;
+    // Run all URLs in one Apify job (cheaper & faster)
+    const rawItems = await runApifyActor(urlsWithMeta.map(u => u.url));
+
+    // Map items to deals
+    const newDeals = [];
+    for (const item of rawItems) {
+      const id = item.id || item.url || `${item.title}-${item.price}`;
       if (!id || seenIds.has(id)) continue;
       seenIds.add(id);
 
-      const price = parseInt(item.price?.replace(/[^0-9]/g, "") || "0") || 0;
-      const isFree = price === 0 || item.price?.toLowerCase().includes("free");
+      // Parse price
+      const rawPrice = item.price || item.priceAmount || "0";
+      const price = parseInt(String(rawPrice).replace(/[^0-9]/g, "")) || 0;
+      const isFree = price === 0 || String(rawPrice).toLowerCase().includes("free");
+
+      // Match to category by title keywords
+      let category = "🔍 Other";
+      for (const config of SEARCH_CONFIGS) {
+        const kw = config.query.split(" ");
+        if (kw.some(k => (item.title || "").toLowerCase().includes(k.toLowerCase()))) {
+          category = config.category;
+          break;
+        }
+      }
 
       newDeals.push({
         listing: {
@@ -167,36 +174,43 @@ async function pollFBMarketplace() {
           title: item.title || item.name || "Untitled",
           price,
           isFree,
-          url: item.url || `https://www.facebook.com/marketplace/item/${item.id}`,
-          image: item.image || item.thumbnail || "",
-          location: item.location || item.city || "Houston area",
+          url: item.url || item.link || `https://www.facebook.com/marketplace/item/${item.id}`,
+          image: item.image || item.thumbnail || item.photos?.[0] || "",
+          location: item.location || item.city || item.sellerLocation || "Houston area",
           condition: item.condition || "",
-          category: config.category,
+          category,
           seenAt: new Date().toISOString(),
           source: "Facebook Marketplace",
         },
-        categoryName: config.category,
+        categoryName: category,
       });
     }
 
-    await sleep(2000); // small gap between categories
-  }
+    addLog(`Processing ${newDeals.length} new unique listings...`);
 
-  addLog(`\nScoring ${newDeals.length} new listings...`);
-  for (const { listing, categoryName } of newDeals) {
-    const analysis = await scoreListing(listing, categoryName);
-    listing.score = analysis.score;
-    listing.analysis = analysis;
-    if (analysis.score >= 5) {
-      dealStore.unshift(listing);
-      addLog(`  ✅ [${analysis.score}/10] $${listing.price} — ${listing.title.slice(0, 45)}`);
+    // Score each listing
+    for (const { listing, categoryName } of newDeals) {
+      const analysis = await scoreListing(listing, categoryName);
+      listing.score = analysis.score;
+      listing.analysis = analysis;
+      if (analysis.score >= 5) {
+        dealStore.unshift(listing);
+        addLog(`  ✅ [${analysis.score}/10] $${listing.price} — ${listing.title.slice(0, 45)}`);
+      } else {
+        addLog(`  ❌ [${analysis.score}/10] skipped: ${listing.title.slice(0, 35)}`);
+      }
+      await sleep(300);
     }
-    await sleep(300);
-  }
 
-  dealStore = dealStore.slice(0, 300);
-  isPolling = false;
-  addLog(`=== Poll done. Store: ${dealStore.length} deals ===\n`);
+    dealStore = dealStore.slice(0, 300);
+    addLog(`=== Poll done. Store: ${dealStore.length} deals ===\n`);
+
+  } catch (e) {
+    lastError = e.message;
+    addLog(`❌ Poll failed: ${e.message}`);
+  } finally {
+    isPolling = false;
+  }
 }
 
 // ── API ───────────────────────────────────────────────────────────────────────
@@ -222,9 +236,7 @@ app.get("/api/stats", (req, res) => {
   res.json({ totalDeals: dealStore.length, lastPoll, pollCount, lastError, isPolling, byCategory, apifyEnabled: !!APIFY_KEY });
 });
 
-app.get("/api/log", (req, res) => {
-  res.json({ log: pollLog });
-});
+app.get("/api/log", (req, res) => res.json({ log: pollLog }));
 
 app.post("/api/poll-now", (req, res) => {
   if (isPolling) return res.json({ message: "Already polling..." });
@@ -241,8 +253,7 @@ app.get("/", (req, res) => {
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>FlipScout 🏪 Magnolia TX</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -269,7 +280,7 @@ select{border:1px solid #e2e8f0;border-radius:8px;padding:7px 10px;font-size:12p
 .card-sub{color:#64748b;font-size:11px;margin-top:3px}
 .score-badge{border-radius:99px;width:44px;height:44px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:17px;flex-shrink:0;color:white}
 .card-body{padding:12px 14px}
-.card-img{width:100%;height:160px;object-fit:cover;border-bottom:1px solid #f1f5f9}
+.card-img{width:100%;height:180px;object-fit:cover;background:#f1f5f9}
 .price-row{display:flex;gap:8px;margin-bottom:10px}
 .price-box{flex:1;border-radius:10px;padding:8px;text-align:center}
 .price-label{font-size:10px;color:#9ca3af;font-weight:600;margin-bottom:2px}
@@ -288,40 +299,36 @@ select{border:1px solid #e2e8f0;border-radius:8px;padding:7px 10px;font-size:12p
 .stat-card{background:white;border-radius:16px;padding:16px;border:1px solid #e2e8f0;margin-bottom:10px}
 .stat-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f1f5f9;font-size:13px}
 .cat-card{background:white;border-radius:12px;padding:14px;border:1px solid #e2e8f0;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center}
-.log-entry{font-family:monospace;font-size:11px;color:#94a3b8;padding:4px 0;border-bottom:1px solid #f1f5f9}
-.alert{background:#fef3c7;border:1px solid #fde047;border-radius:12px;padding:14px;margin-bottom:14px;font-size:13px;color:#713f12}
+.log-entry{font-family:monospace;font-size:11px;color:#64748b;padding:5px 0;border-bottom:1px solid #f8fafc;line-height:1.4}
 </style>
 </head>
 <body>
-<div class="header">
-  <div class="inner">
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px">
-      <div>
-        <div class="eyebrow">Magnolia TX · FB Marketplace · Auto Scout</div>
-        <div class="logo">Flip<span>Scout</span> 🤖</div>
-        <div class="status" id="status-text">⏳ Connecting...</div>
-      </div>
-      <button class="scan-btn" id="scan-btn" onclick="scanNow()">📘 Scan FB</button>
+<div class="header"><div class="inner">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px">
+    <div>
+      <div class="eyebrow">Magnolia TX · FB Marketplace · Auto Scout</div>
+      <div class="logo">Flip<span>Scout</span> 🤖</div>
+      <div class="status" id="status-text">⏳ Connecting...</div>
     </div>
-    <div class="stats-grid">
-      <div class="stat-box"><div class="stat-val" id="s-deals" style="color:#a5b4fc">—</div><div class="stat-label">Deals</div></div>
-      <div class="stat-box"><div class="stat-val" id="s-hot" style="color:#34d399">—</div><div class="stat-label">🔥 Hot</div></div>
-      <div class="stat-box"><div class="stat-val" id="s-free" style="color:#fbbf24">—</div><div class="stat-label">🆓 Free</div></div>
-      <div class="stat-box"><div class="stat-val" id="s-profit" style="color:#f472b6">—</div><div class="stat-label">Profit Pool</div></div>
-    </div>
-    <div class="tabs">
-      <button class="tab active" onclick="showTab('deals')">🔍 Deals</button>
-      <button class="tab" onclick="showTab('stats')">📊 Stats</button>
-      <button class="tab" onclick="showTab('log')">⚙️ Log</button>
-    </div>
+    <button class="scan-btn" id="scan-btn" onclick="scanNow()">📘 Scan FB</button>
   </div>
-</div>
+  <div class="stats-grid">
+    <div class="stat-box"><div class="stat-val" id="s-deals" style="color:#a5b4fc">—</div><div class="stat-label">Deals</div></div>
+    <div class="stat-box"><div class="stat-val" id="s-hot" style="color:#34d399">—</div><div class="stat-label">🔥 Hot</div></div>
+    <div class="stat-box"><div class="stat-val" id="s-free" style="color:#fbbf24">—</div><div class="stat-label">🆓 Free</div></div>
+    <div class="stat-box"><div class="stat-val" id="s-profit" style="color:#f472b6">—</div><div class="stat-label">Profit Pool</div></div>
+  </div>
+  <div class="tabs">
+    <button class="tab active" onclick="showTab('deals')">🔍 Deals</button>
+    <button class="tab" onclick="showTab('stats')">📊 Stats</button>
+    <button class="tab" onclick="showTab('log')">⚙️ Log</button>
+  </div>
+</div></div>
 
 <div id="deals-tab" class="body">
-  <div id="no-apify-alert" class="alert hidden">⚠️ <strong>Apify key not set.</strong> Add <code>APIFY_API_KEY</code> in Railway Variables to enable FB Marketplace scanning.</div>
   <div id="polling-bar" class="polling-bar hidden">
     <div class="spin"></div>
-    <span id="polling-msg">Scanning Facebook Marketplace... takes 5–10 min.</span>
+    <span id="polling-msg">Scanning Facebook Marketplace... 5–10 min. Check Log tab for progress.</span>
   </div>
   <div class="filters">
     <select id="cat-filter" onchange="applyFilters()">
@@ -336,162 +343,108 @@ select{border:1px solid #e2e8f0;border-radius:8px;padding:7px 10px;font-size:12p
       <option value="7">Score 7+</option><option value="8">🔥 Hot only (8+)</option>
     </select>
   </div>
-  <div id="deals-list"><div class="empty"><div style="font-size:36px;margin-bottom:12px">📘</div><strong style="display:block;margin-bottom:6px">No deals yet</strong><span style="font-size:13px">Hit Scan FB to search Facebook Marketplace</span><br><button onclick="scanNow()" style="background:#1877f2;color:white;border:none;border-radius:12px;padding:12px 24px;font-weight:800;font-size:14px;cursor:pointer;margin-top:14px">📘 Scan FB Marketplace</button></div></div>
+  <div id="deals-list"><div class="empty"><div style="font-size:36px;margin-bottom:12px">📘</div><strong style="display:block;margin-bottom:8px">Ready to scan FB Marketplace</strong><span style="font-size:13px;display:block;margin-bottom:16px">8 categories · Houston area · AI-scored</span><button onclick="scanNow()" style="background:#1877f2;color:white;border:none;border-radius:12px;padding:14px 28px;font-weight:800;font-size:15px;cursor:pointer">📘 Scan Facebook Marketplace</button></div></div>
 </div>
 
-<div id="stats-tab" class="hidden">
-  <div id="stats-content" class="inner"><div class="empty">Loading...</div></div>
-</div>
-
-<div id="log-tab" class="hidden">
-  <div class="inner">
-    <div style="font-size:10px;color:#94a3b8;font-weight:800;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Live Poll Log</div>
-    <div id="log-content"><div class="empty">No log entries yet</div></div>
-  </div>
-</div>
+<div id="stats-tab" class="hidden"><div id="stats-content" class="inner"><div class="empty">Loading...</div></div></div>
+<div id="log-tab" class="hidden"><div class="inner"><div style="font-size:10px;color:#94a3b8;font-weight:800;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Live Activity Log</div><div id="log-content"><div class="empty">No activity yet — run a scan first</div></div></div></div>
 
 <script>
 let allDeals=[],scanning=false,checkInterval=null;
-
-function timeAgo(iso){
-  const d=Date.now()-new Date(iso).getTime(),m=Math.floor(d/60000);
-  if(m<1)return'just now';if(m<60)return m+'m ago';
-  const h=Math.floor(m/60);if(h<24)return h+'h ago';return Math.floor(h/24)+'d ago';
-}
+function timeAgo(iso){const d=Date.now()-new Date(iso).getTime(),m=Math.floor(d/60000);if(m<1)return'just now';if(m<60)return m+'m ago';const h=Math.floor(m/60);if(h<24)return h+'h ago';return Math.floor(h/24)+'d ago';}
 function scoreColor(s){return s>=8?'#059669':s>=6?'#d97706':'#6b7280';}
 
 function renderDeals(deals){
   const el=document.getElementById('deals-list');
-  if(!deals.length){
-    el.innerHTML='<div class="empty"><div style="font-size:36px;margin-bottom:12px">📘</div><strong style="display:block;margin-bottom:6px">No deals yet</strong><span style="font-size:13px">Hit Scan FB — first scan takes 5–10 min</span><br><button onclick="scanNow()" style="background:#1877f2;color:white;border:none;border-radius:12px;padding:12px 24px;font-weight:800;font-size:14px;cursor:pointer;margin-top:14px">📘 Scan FB Marketplace</button></div>';
-    return;
-  }
+  if(!deals.length){el.innerHTML='<div class="empty"><div style="font-size:36px;margin-bottom:12px">📡</div><strong style="display:block;margin-bottom:8px">No deals yet</strong><button onclick="scanNow()" style="background:#1877f2;color:white;border:none;border-radius:12px;padding:12px 24px;font-weight:800;font-size:14px;cursor:pointer;margin-top:8px">📘 Scan FB Marketplace</button></div>';return;}
   el.innerHTML=deals.map(d=>{
     const a=d.analysis||{};
-    const imgHtml=d.image?'<img class="card-img" src="'+d.image+'" onerror="this.style.display=\'none\'" alt=""/>':'';
-    return \`<div class="card">
-      \${imgHtml}
-      <div class="card-header">
-        <div style="flex:1;min-width:0">
-          <div class="card-title">\${d.title}</div>
-          <div class="card-sub">\${d.category} · \${d.location||'Houston area'} · \${timeAgo(d.seenAt)}</div>
-        </div>
-        <div class="score-badge" style="background:\${scoreColor(d.score)}">\${d.score}</div>
-      </div>
-      <div class="card-body">
-        <div class="price-row">
-          <div class="price-box" style="background:\${d.isFree?'#fef9c3':'#fff1f2'}"><div class="price-label">BUY</div><div class="price-val" style="color:\${d.isFree?'#854d0e':'#be123c'}">\${d.isFree?'FREE':'$'+d.price}</div></div>
-          <div class="price-box" style="background:#f0fdf4"><div class="price-label">SELL</div><div class="price-val" style="color:#15803d">$\${a.estimatedSellPrice||'—'}</div></div>
-          <div class="price-box" style="background:#eff6ff"><div class="price-label">PROFIT</div><div class="price-val" style="color:#1d4ed8">$\${a.estimatedProfit||'—'}</div></div>
-        </div>
-        <div class="tags">
-          <span class="tag" style="background:#f1f5f9;color:#475569">\${a.verdict||''}</span>
-          \${a.urgency==='Grab today'?'<span class="tag" style="background:#fef3c7;color:#92400e">⚡ Grab today</span>':''}
-          \${d.isFree?'<span class="tag" style="background:#dcfce7;color:#166534">🆓 FREE</span>':''}
-          \${d.condition?'<span class="tag" style="background:#f0f9ff;color:#0369a1">'+d.condition+'</span>':''}
-        </div>
-        \${a.tip?'<div class="tip-box">💡 '+a.tip+'</div>':''}
-        \${a.redFlags&&a.redFlags!=='None'?'<div class="flag-box">⚠️ '+a.redFlags+'</div>':''}
-        <a href="\${d.url}" target="_blank" class="view-btn">View on Facebook Marketplace →</a>
-      </div>
-    </div>\`;
+    return '<div class="card">'+
+      (d.image?'<img class="card-img" src="'+d.image+'" onerror="this.style.display=\'none\'" alt=""/>':'')+
+      '<div class="card-header"><div style="flex:1;min-width:0"><div class="card-title">'+d.title+'</div><div class="card-sub">'+d.category+' · '+(d.location||'Houston area')+' · '+timeAgo(d.seenAt)+'</div></div><div class="score-badge" style="background:'+scoreColor(d.score)+'">'+d.score+'</div></div>'+
+      '<div class="card-body">'+
+      '<div class="price-row">'+
+      '<div class="price-box" style="background:'+(d.isFree?'#fef9c3':'#fff1f2')+'"><div class="price-label">BUY</div><div class="price-val" style="color:'+(d.isFree?'#854d0e':'#be123c')+'">'+(d.isFree?'FREE':'$'+d.price)+'</div></div>'+
+      '<div class="price-box" style="background:#f0fdf4"><div class="price-label">SELL</div><div class="price-val" style="color:#15803d">$'+(a.estimatedSellPrice||'—')+'</div></div>'+
+      '<div class="price-box" style="background:#eff6ff"><div class="price-label">PROFIT</div><div class="price-val" style="color:#1d4ed8">$'+(a.estimatedProfit||'—')+'</div></div>'+
+      '</div>'+
+      '<div class="tags"><span class="tag" style="background:#f1f5f9;color:#475569">'+(a.verdict||'')+'</span>'+(a.urgency==='Grab today'?'<span class="tag" style="background:#fef3c7;color:#92400e">⚡ Grab today</span>':'')+(d.isFree?'<span class="tag" style="background:#dcfce7;color:#166534">🆓 FREE</span>':'')+(d.condition?'<span class="tag" style="background:#f0f9ff;color:#0369a1">'+d.condition+'</span>':'')+'</div>'+
+      (a.tip?'<div class="tip-box">💡 '+a.tip+'</div>':'')+
+      (a.redFlags&&a.redFlags!=='None'?'<div class="flag-box">⚠️ '+a.redFlags+'</div>':'')+
+      '<a href="'+d.url+'" target="_blank" class="view-btn">View on Facebook Marketplace →</a>'+
+      '</div></div>';
   }).join('');
 }
 
 function applyFilters(){
-  const cat=document.getElementById('cat-filter').value;
-  const min=parseInt(document.getElementById('score-filter').value);
-  let f=allDeals.filter(d=>d.score>=min);
-  if(cat!=='All')f=f.filter(d=>d.category===cat);
-  renderDeals(f);
+  const cat=document.getElementById('cat-filter').value,min=parseInt(document.getElementById('score-filter').value);
+  let f=allDeals.filter(d=>d.score>=min);if(cat!=='All')f=f.filter(d=>d.category===cat);renderDeals(f);
 }
 
 async function fetchDeals(){
   try{
-    const r=await fetch('/api/deals?limit=200');
-    const data=await r.json();
+    const r=await fetch('/api/deals?limit=200'),data=await r.json();
     allDeals=data.deals||[];
-    const hot=allDeals.filter(d=>d.score>=8).length;
-    const free=allDeals.filter(d=>d.isFree).length;
-    const profit=allDeals.reduce((s,d)=>s+(d.analysis?.estimatedProfit||0),0);
+    const hot=allDeals.filter(d=>d.score>=8).length,free=allDeals.filter(d=>d.isFree).length,profit=allDeals.reduce((s,d)=>s+(d.analysis?.estimatedProfit||0),0);
     document.getElementById('s-deals').textContent=allDeals.length;
     document.getElementById('s-hot').textContent=hot;
     document.getElementById('s-free').textContent=free;
     document.getElementById('s-profit').textContent='$'+profit.toLocaleString();
     document.getElementById('status-text').textContent='🟢 Live · '+new Date().toLocaleTimeString()+' · Auto-scans 2x daily';
     const bar=document.getElementById('polling-bar');
-    if(data.meta?.isPolling){
-      bar.classList.remove('hidden');
-      if(allDeals.length>0)document.getElementById('polling-msg').textContent='Scanning FB... '+allDeals.length+' deals found so far';
-    } else {
-      bar.classList.add('hidden');
-      if(scanning){scanning=false;const btn=document.getElementById('scan-btn');btn.textContent='📘 Scan FB';btn.disabled=false;if(checkInterval){clearInterval(checkInterval);checkInterval=null;}}
-    }
+    if(data.meta?.isPolling){bar.classList.remove('hidden');if(allDeals.length>0)document.getElementById('polling-msg').textContent='Scanning FB... '+allDeals.length+' deals found so far';}
+    else{bar.classList.add('hidden');if(scanning){scanning=false;const btn=document.getElementById('scan-btn');btn.textContent='📘 Scan FB';btn.disabled=false;if(checkInterval){clearInterval(checkInterval);checkInterval=null;}}}
     applyFilters();
-  }catch(e){document.getElementById('status-text').textContent='🔴 Connection error';}
+  }catch{document.getElementById('status-text').textContent='🔴 Connection error';}
+}
+
+async function scanNow(){
+  if(scanning)return;scanning=true;
+  const btn=document.getElementById('scan-btn');btn.textContent='Scanning...';btn.disabled=true;
+  document.getElementById('polling-bar').classList.remove('hidden');
+  try{await fetch('/api/poll-now',{method:'POST'});if(checkInterval)clearInterval(checkInterval);checkInterval=setInterval(fetchDeals,10000);}
+  catch{scanning=false;btn.textContent='📘 Scan FB';btn.disabled=false;}
 }
 
 async function fetchStats(){
   try{
-    const r=await fetch('/api/stats');const s=await r.json();
-    if(!s.apifyEnabled)document.getElementById('no-apify-alert').classList.remove('hidden');
-    const cats=Object.entries(s.byCategory||{}).map(([cat,d])=>
-      '<div class="cat-card"><div><div style="font-weight:700;font-size:14px">'+cat+'</div><div style="font-size:12px;color:#94a3b8">'+d.count+' deals</div></div><div style="text-align:center"><div style="font-size:10px;color:#94a3b8">Avg Score</div><div style="font-size:24px;font-weight:900;color:#6366f1">'+d.avgScore+'</div></div></div>'
-    ).join('');
-    document.getElementById('stats-content').innerHTML=
-      '<div class="stat-card"><div style="font-size:10px;color:#94a3b8;font-weight:800;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Server</div>'+
+    const r=await fetch('/api/stats'),s=await r.json();
+    const cats=Object.entries(s.byCategory||{}).map(([cat,d])=>'<div class="cat-card"><div><div style="font-weight:700;font-size:14px">'+cat+'</div><div style="font-size:12px;color:#94a3b8">'+d.count+' deals</div></div><div style="text-align:center"><div style="font-size:10px;color:#94a3b8">Avg</div><div style="font-size:24px;font-weight:900;color:#6366f1">'+d.avgScore+'</div></div></div>').join('');
+    document.getElementById('stats-content').innerHTML='<div class="stat-card"><div style="font-size:10px;color:#94a3b8;font-weight:800;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Server</div>'+
       '<div class="stat-row"><span style="color:#64748b">Source</span><span style="font-weight:700">📘 Facebook Marketplace</span></div>'+
       '<div class="stat-row"><span style="color:#64748b">Apify</span><span style="font-weight:700">'+(s.apifyEnabled?'🟢 Connected':'🔴 No API key')+'</span></div>'+
       '<div class="stat-row"><span style="color:#64748b">Status</span><span style="font-weight:700">'+(s.isPolling?'⏳ Scanning':'✅ Idle')+'</span></div>'+
       '<div class="stat-row"><span style="color:#64748b">Total scored</span><span style="font-weight:700">'+s.totalDeals+'</span></div>'+
       '<div class="stat-row"><span style="color:#64748b">Polls run</span><span style="font-weight:700">'+s.pollCount+'</span></div>'+
       '<div class="stat-row"><span style="color:#64748b">Last poll</span><span style="font-weight:700">'+(s.lastPoll?timeAgo(s.lastPoll):'Never')+'</span></div>'+
-      '<div class="stat-row" style="border:none"><span style="color:#64748b">Last error</span><span style="font-weight:700;font-size:11px;color:#dc2626">'+(s.lastError||'None')+'</span></div></div>'+cats;
+      '<div class="stat-row" style="border:none"><span style="color:#64748b">Last error</span><span style="font-weight:700;font-size:11px;color:#dc2626">'+(s.lastError||'✅ None')+'</span></div></div>'+cats;
   }catch{}
 }
 
 async function fetchLog(){
   try{
-    const r=await fetch('/api/log');const d=await r.json();
+    const r=await fetch('/api/log'),d=await r.json();
     const el=document.getElementById('log-content');
-    if(!d.log||!d.log.length){el.innerHTML='<div class="empty">No log yet — run a scan first</div>';return;}
+    if(!d.log?.length){el.innerHTML='<div class="empty">No log yet</div>';return;}
     el.innerHTML=d.log.map(l=>'<div class="log-entry">'+l+'</div>').join('');
   }catch{}
 }
 
-async function scanNow(){
-  if(scanning)return;
-  scanning=true;
-  const btn=document.getElementById('scan-btn');
-  btn.textContent='Scanning...';btn.disabled=true;
-  document.getElementById('polling-bar').classList.remove('hidden');
-  try{
-    await fetch('/api/poll-now',{method:'POST'});
-    if(checkInterval)clearInterval(checkInterval);
-    checkInterval=setInterval(fetchDeals,10000);
-  }catch{scanning=false;btn.textContent='📘 Scan FB';btn.disabled=false;}
-}
-
 function showTab(n){
-  ['deals','stats','log'].forEach(t=>{
-    document.getElementById(t+'-tab').classList.toggle('hidden',t!==n);
-  });
+  ['deals','stats','log'].forEach(t=>document.getElementById(t+'-tab').classList.toggle('hidden',t!==n));
   document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',['deals','stats','log'][i]===n));
-  if(n==='stats')fetchStats();
-  if(n==='log')fetchLog();
+  if(n==='stats')fetchStats();if(n==='log')fetchLog();
 }
 
-fetchDeals();
-setInterval(fetchDeals,20000);
+fetchDeals();setInterval(fetchDeals,20000);
 </script>
-</body>
-</html>`);
+</body></html>`);
 });
 
-// Scan twice daily — 7am and 5pm CT
-cron.schedule("0 12 * * *", () => { if (!isPolling) pollFBMarketplace().catch(console.error); });
-cron.schedule("0 23 * * *", () => { if (!isPolling) pollFBMarketplace().catch(console.error); });
+// Auto-scan 7am and 5pm CT
+cron.schedule("0 12 * * *", () => { if(!isPolling) pollFBMarketplace().catch(console.error); });
+cron.schedule("0 23 * * *", () => { if(!isPolling) pollFBMarketplace().catch(console.error); });
 
 app.listen(PORT, () => {
-  console.log(`FlipScout on port ${PORT} | Apify: ${APIFY_KEY ? "ON" : "OFF"}`);
+  console.log(`FlipScout on port ${PORT} | Apify: ${APIFY_KEY ? "ON" : "OFF"} | Actor: ${ACTOR_ID}`);
 });
